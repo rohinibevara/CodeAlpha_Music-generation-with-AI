@@ -1,0 +1,63 @@
+from music21 import converter, instrument, note, chord
+import glob
+import numpy as np
+
+# ----------------------------
+# Step 1: Load MIDI files and extract notes/chords
+# ----------------------------
+midi_files = glob.glob("midi_folder/*.mid")  # Change to your folder path
+notes = []
+
+for file in midi_files:
+    midi = converter.parse(file)
+    parts = instrument.partitionByInstrument(midi)
+    
+    if parts:  # multiple instruments
+        for part in parts.parts:
+            for element in part.recurse():
+                if isinstance(element, note.Note):
+                    notes.append(str(element.pitch))
+                elif isinstance(element, chord.Chord):
+                    notes.append('.'.join(str(n) for n in element.normalOrder))
+    else:  # single instrument
+        for element in midi.flat.notes:
+            if isinstance(element, note.Note):
+                notes.append(str(element.pitch))
+            elif isinstance(element, chord.Chord):
+                notes.append('.'.join(str(n) for n in element.normalOrder))
+
+print("Total notes/chords extracted:", len(notes))
+
+# ----------------------------
+# Step 2: Create a mapping of notes to integers
+# ----------------------------
+pitchnames = sorted(set(notes))
+note_to_int = {note: number for number, note in enumerate(pitchnames)}
+int_to_note = {number: note for number, note in enumerate(pitchnames)}
+
+# ----------------------------
+# Step 3: Prepare sequences for LSTM training
+# ----------------------------
+sequence_length = 100
+network_input = []
+network_output = []
+
+for i in range(len(notes) - sequence_length):
+    seq_in = notes[i:i + sequence_length]
+    seq_out = notes[i + sequence_length]
+    network_input.append([note_to_int[n] for n in seq_in])
+    network_output.append(note_to_int[seq_out])
+
+n_patterns = len(network_input)
+print("Number of sequences:", n_patterns)
+
+# Reshape input for LSTM [samples, time steps, features] and normalize
+network_input = np.reshape(network_input, (n_patterns, sequence_length, 1))
+network_input = network_input / float(len(pitchnames))
+
+# One-hot encode the output
+from keras.utils import to_categorical
+network_output = to_categorical(network_output, num_classes=len(pitchnames))
+
+print("Input shape:", network_input.shape)
+print("Output shape:", network_output.shape)
