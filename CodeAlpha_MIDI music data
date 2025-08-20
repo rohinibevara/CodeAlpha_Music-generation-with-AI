@@ -1,0 +1,149 @@
+import os, subprocess, requests, zipfile, io, glob, shutil
+import pandas as pd
+import pretty_midi
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+# ----------------------------
+# 1️⃣ Install requirements
+# ----------------------------
+req_file = "requirements.txt"
+if os.path.exists(req_file):
+    print("Installing Python packages...")
+    subprocess.check_call([os.sys.executable, "-m", "pip", "install", "-r", req_file])
+else:
+    print("requirements.txt not found! Skipping package install.")
+
+# ----------------------------
+# 2️⃣ Download Datasets
+# ----------------------------
+os.makedirs("data/raw", exist_ok=True)
+
+# (a) MAESTRO
+maestro_url = "https://huggingface.co/datasets/projectlosangeles/maestro-v3.0.0/resolve/main/maestro-v3.0.0-midi.zip"
+maestro_out = "data/raw/maestro"
+os.makedirs(maestro_out, exist_ok=True)
+if not os.listdir(maestro_out):
+    print("Downloading MAESTRO...")
+    r = requests.get(maestro_url, stream=True)
+    r.raise_for_status()
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    z.extractall(maestro_out)
+    print("Done:", maestro_out)
+else:
+    print("MAESTRO already exists, skipping.")
+
+# (b) GiantMIDI-Piano
+giant_dir = "data/raw/giantmidi"
+if not os.path.exists(giant_dir):
+    print("Cloning GiantMIDI-Piano...")
+    subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/bytedance/GiantMIDI-Piano.git", giant_dir])
+else:
+    print("GiantMIDI already exists, skipping.")
+
+# (c) POP909
+pop_dir = "data/raw/pop909"
+if not os.path.exists(pop_dir):
+    print("Cloning POP909...")
+    subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/music-x-lab/POP909-Dataset.git", pop_dir])
+else:
+    print("POP909 already exists, skipping.")
+
+# (d) LMD
+lmd_dir = "data/raw/lmd"
+os.makedirs(lmd_dir, exist_ok=True)
+lmd_file = os.path.join(lmd_dir, "lmd_matched.tar.gz")
+if not os.path.exists(lmd_file):
+    print("Downloading LMD subset...")
+    url = "http://hog.ee.columbia.edu/craffel/lmd/lmd_matched.tar.gz"
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
+    with open(lmd_file, "wb") as f:
+        for chunk in r.iter_content(1<<20): f.write(chunk)
+    print("Saved:", lmd_file)
+else:
+    print("LMD subset already exists, skipping.")
+
+# (e) Groove MIDI Dataset
+gmd_dir = "data/raw/gmd"
+os.makedirs(gmd_dir, exist_ok=True)
+gmd_zip = os.path.join(gmd_dir, "groove.zip")
+if not os.listdir(gmd_dir):
+    print("Downloading Groove MIDI Dataset...")
+    gmd_url = "https://storage.googleapis.com/magentadata/datasets/groove/groove-v1.0.0-midionly.zip"
+    r = requests.get(gmd_url, stream=True)
+    r.raise_for_status()
+    with open(gmd_zip, "wb") as f: f.write(r.content)
+    zipfile.ZipFile(gmd_zip).extractall(gmd_dir)
+    print("Done:", gmd_dir)
+else:
+    print("Groove MIDI already exists, skipping.")
+
+# ----------------------------
+# 3️⃣ Validate & Metadata
+# ----------------------------
+RAW = "data/raw"
+PROCESSED = "data/processed"
+os.makedirs(PROCESSED, exist_ok=True)
+META_DIR = "data/metadata"
+os.makedirs(META_DIR, exist_ok=True)
+
+FOLDER_GENRE = {
+    "maestro": "classical",
+    "giantmidi": "classical",
+    "pop909": "pop",
+    "gmd": "drums",
+    "lmd": "mixed"
+}
+
+def infer_key(pm: pretty_midi.PrettyMIDI):
+    hist = np.zeros(12)
+    for inst in pm.instruments:
+        for n in inst.notes:
+            hist[n.pitch % 12] += n.end - n.start
+    keys = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B']
+    return keys[int(hist.argmax())]
+
+def is_valid_midi(path):
+    try:
+        pm = pretty_midi.PrettyMIDI(path)
+        if pm.get_end_time() < 2.0: return None
+        if sum(len(i.notes) for i in pm.instruments) < 8: return None
+        tempo = pm.estimate_tempo()
+        key = infer_key(pm)
+        return dict(duration=pm.get_end_time(), tempo=float(tempo), key=key)
+    except:
+        return None
+
+rows = []
+for src, genre in FOLDER_GENRE.items():
+    root = os.path.join(RAW, src)
+    if not os.path.isdir(root): continue
+    for path in tqdm(glob.glob(root + "/**/*.mid*", recursive=True), desc=src):
+        meta = is_valid_midi(path)
+        if meta:
+            meta.update({"path": path.replace("\\","/"), "tag": genre})
+            rows.append(meta)
+
+df = pd.DataFrame(rows)
+df.to_csv(os.path.join(META_DIR, "midi_index.csv"), index=False)
+print("Indexed:", len(df), "valid MIDI files.")
+
+# ----------------------------
+# 4️⃣ Train/Val/Test Split
+# ----------------------------
+df = pd.read_csv(os.path.join(META_DIR, "midi_index.csv"))
+for genre in df['tag'].unique():
+    sub = df[df['tag']==genre].sample(frac=1, random_state=42)
+    train, tmp = train_test_split(sub, test_size=0.2, random_state=42)
+    val, test = train_test_split(tmp, test_size=0.5, random_state=42)
+    for split, part in [('train',train),('val',val),('test',test)]:
+        outdir = os.path.join(PROCESSED, genre, split)
+        os.makedirs(outdir, exist_ok=True)
+        for p in part['path']:
+            try: shutil.copy2(p, os.path.join(outdir, os.path.basename(p)))
+            except: pass
+    print(f"{genre}: {len(train)}/{len(val)}/{len(test)}")
+
+print("\n✅ All done! Check 'data/processed/' for final output.")
